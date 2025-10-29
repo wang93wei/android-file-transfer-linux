@@ -114,6 +114,7 @@ jobs:
                 -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR} \
                 -DOPENSSL_LIBRARIES=${OPENSSL_LIBRARIES} \
                 -DCMAKE_INSTALL_PREFIX=appdir \
+                -DCMAKE_INSTALL_NAME_TOOL=/usr/bin/install_name_tool \
                 -B build -G Ninja .
 
       - name: Configure Build (Apple Silicon)
@@ -127,6 +128,7 @@ jobs:
                 -DCMAKE_INSTALL_PREFIX=appdir \
                 -DCMAKE_OSX_ARCHITECTURES=arm64 \
                 -DBUILD_PYTHON=OFF \
+                -DCMAKE_INSTALL_NAME_TOOL=/usr/bin/install_name_tool \
                 -B build -G Ninja .
 
       - name: Build Application
@@ -135,44 +137,43 @@ jobs:
       - name: Install Application
         run: ninja -C build install
 
-      - name: Package DMG
+      - name: Package Application (ZIP)
         run: |
+          # 跳过 macdeployqt，直接打包 .app 文件
           mv appdir/android-file-transfer.app appdir/Android\ File\ Transfer\ for\ Linux.app
-          git clone https://github.com/andreyvit/create-dmg.git
-          cd create-dmg
-          if [ "${{ matrix.arch }}" == "arm64" ]; then
-            ./create-dmg --volicon "../osx/android-file-transfer.icns" \
-                        --icon-size 96 \
-                        --icon "Android File Transfer for Linux" 110 100 \
-                        --app-drop-link 380 100 \
-                        AndroidFileTransferForLinux-ARM64.dmg \
-                        ../appdir/Android\ File\ Transfer\ for\ Linux.app
-          else
-            ./create-dmg --volicon "../osx/android-file-transfer.icns" \
-                        --icon-size 96 \
-                        --icon "Android File Transfer for Linux" 110 100 \
-                        --app-drop-link 380 100 \
-                        AndroidFileTransferForLinux.dmg \
-                        ../appdir/Android\ File\ Transfer\ for\ Linux.app
-          fi
           
-      - name: Check DMG Files
+          # 复制图标文件到 app 包内
+          cp osx/android-file-transfer.icns appdir/Android\ File\ Transfer\ for\ Linux.app/Contents/Resources/ || true
+          
+          # 创建 ZIP 包，包含架构信息
+          cd appdir
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            zip -r ../AndroidFileTransferForLinux-ARM64.zip "Android File Transfer for Linux.app"
+            echo "Created ARM64 ZIP package"
+          else
+            zip -r ../AndroidFileTransferForLinux.zip "Android File Transfer for Linux.app"
+            echo "Created Intel ZIP package"
+          fi
+          cd ..
+          
+          echo "Package contents:"
+          unzip -l AndroidFileTransferForLinux*.zip | head -20
+          
+      - name: Check Package Files
         run: |
-          echo "Checking for DMG files..."
-          ls -la create-dmg/*.dmg || echo "No DMG files found"
-          find . -name "*.dmg" -type f || echo "No DMG files found in workspace"
+          echo "Checking for package files..."
+          ls -la *.zip 2>/dev/null || echo "No ZIP files found in workspace"
+          find . -name "*.zip" 2>/dev/null || echo "No ZIP files found"
 
-      - name: Code Sign (Apple Silicon)
-        if: matrix.arch == 'arm64' && github.ref_type == 'tag'
+      - name: Code Sign (Optional)
+        if: github.ref_type == 'tag'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ]; then
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "Code signing application..."
             echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
             security create-keychain -p "" build.keychain
             security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
@@ -181,7 +182,9 @@ jobs:
             
             codesign --force --deep --sign "$APPLE_SIGNING_IDENTITY" \
                     --options runtime \
-                    create-dmg/*.dmg
+                    appdir/Android\ File\ Transfer\ for\ Linux.app/* || echo "Code signing failed, continuing without signing"
+          else
+            echo "No code signing certificate available, skipping code signing"
           fi
 
       - name: Upload to Release (Tag)
@@ -192,7 +195,7 @@ jobs:
           omitBody: true
           omitName: true
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: create-dmg/*.dmg
+          artifacts: AndroidFileTransferForLinux*.zip
           tag: ${{ github.ref_name }}
           makeLatest: true
 
@@ -204,7 +207,7 @@ jobs:
           omitBody: true
           omitName: true
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: create-dmg/*.dmg
+          artifacts: AndroidFileTransferForLinux*.zip
           tag: continuous
           prerelease: true
           removeArtifacts: true

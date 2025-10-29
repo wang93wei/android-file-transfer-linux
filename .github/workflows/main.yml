@@ -1,0 +1,302 @@
+name: Android File Transfer for Linux (and macOS!)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - MacOS_I8n_Fix
+    tags:
+      - "v*"
+
+permissions: write-all
+env:
+  TAG_NAME: continuous
+  TAG_CHANNEL: Continuous
+concurrency:
+  group: "${{ github.workflow }} - ${{ github.head_ref || github.ref }}"
+
+jobs:
+  check_tag:
+    name: Check Tag Version Consistency
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Check tag format
+        id: check_tag
+        run: |
+          TAG_REF="${GITHUB_REF##*/}"
+          echo "Current tag: $TAG_REF"
+          if [[ ! "$TAG_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            echo "Tag format should be v*.*.*"
+            exit 1
+          fi
+          echo "Tag format is valid."
+
+  delete_old_release:
+    name: Delete Old Continuous Release
+    needs: check_tag
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'master' || github.ref_type == 'tag'
+    steps:
+      - name: Delete Old Continuous Release
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tagName = '${{ env.TAG_NAME }}';
+            
+            try {
+              // 获取release
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag: tagName
+              });
+              
+              // 删除release下的所有资产
+              if (release.assets && release.assets.length > 0) {
+                for (const asset of release.assets) {
+                  await github.rest.repos.deleteReleaseAsset({
+                    owner,
+                    repo,
+                    asset_id: asset.id
+                  });
+                }
+              }
+              
+              // 删除release
+              await github.rest.repos.deleteRelease({
+                owner,
+                repo,
+                release_id: release.id
+              });
+              
+              // 删除tag
+              await github.rest.git.deleteRef({
+                owner,
+                repo,
+                ref: `tags/${tagName}`
+              });
+              
+            } catch (error) {
+              if (error.status !== 404) {
+                console.error('Error:', error);
+                throw error;
+              }
+            }
+
+  update_release:
+    name: Update Release
+    runs-on: ubuntu-latest
+    needs: delete_old_release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set Build Time
+        run: echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Create Release Notes
+        run: |
+          cat > release.txt << EOF
+          ## Android File Transfer for Linux - ${{ env.TAG_CHANNEL }} Build
+          
+          This is the ${{ env.TAG_CHANNEL }} build of Android File Transfer for Linux.
+          
+          ### Downloads
+          
+          #### Linux
+          - **AppImage**: For most Linux distributions (x86_64)
+          
+          #### macOS  
+          - **DMG**: For macOS 10.12 and later (Intel)
+          - **Apple Silicon**: Native ARM64 support (coming soon)
+          
+          ### System Requirements
+          - Linux: Modern distribution with FUSE support
+          - macOS: 10.12 or later
+          
+          ### Features
+          - MTP client for Android devices
+          - Simple and intuitive UI
+          - No file size limitations
+          - FUSE wrapper for mounting devices
+          - Command line tools
+          - Multi-language support (now including Chinese!)
+          
+          ### Installation
+          1. Download the appropriate package for your system
+          2. For AppImage: Make executable and run
+          3. For DMG: Mount and drag to Applications
+          
+          Build time: ${{ env.BUILDTIME }}
+          Git commit: ${{ github.sha }}
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Android File Transfer for Linux ${{ env.TAG_CHANNEL }}"
+          body_path: release.txt
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: false
+
+  build-linux:
+    name: Build Linux x86_64
+    needs: update_release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install qtbase5-dev qt5-qmake qttools5-dev qttools5-dev-tools libgtk2.0-dev libfuse3-dev libfuse2 libmagic-dev libtag1-dev libssl-dev ninja-build cmake
+
+      - name: Configure Build
+        run: cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=appdir/usr -B build -GNinja .
+
+      - name: Build Application
+        run: ninja -j$(nproc) -C build
+
+      - name: Install Application
+        run: ninja -C build install
+
+      - name: Create AppImage
+        run: |
+          sed -i -e 's|^Name=.*|Name=Android File Transfer For Linux|g' build/appdir/usr/share/applications/android-file-transfer.desktop
+          wget -c -q "https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage"
+          chmod a+x linuxdeployqt-continuous-x86_64.AppImage
+          unset QTDIR
+          unset QT_PLUGIN_PATH
+          unset LD_LIBRARY_PATH
+          export VERSION=$(git rev-parse --short HEAD)
+          ./linuxdeployqt-continuous-x86_64.AppImage build/appdir/usr/share/applications/*.desktop -bundle-non-qt-libs -appimage
+          find build/appdir -executable -type f -exec ldd {} \; | grep " => /usr" | cut -d " " -f 2-3 | sort | uniq
+
+      - name: Upload Release Artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Android File Transfer for Linux ${{ env.TAG_CHANNEL }}"
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: ./Android*.AppImage*
+
+  build-macos:
+    name: Build macOS
+    needs: update_release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+            arch: x64
+          - os: macos-latest
+            target: aarch64-apple-darwin  
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          brew tap homebrew/cask
+          brew install qt@5 homebrew/cask/macfuse taglib openssl@1.1 cmake ninja libmagic
+
+      - name: Configure Build (Intel)
+        if: matrix.arch == 'x64'
+        run: |
+          cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.12 \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_PREFIX_PATH=$(brew --prefix qt@5) \
+                -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@1.1) \
+                -DOPENSSL_LIBRARIES=$(brew --prefix openssl@1.1)/lib \
+                -DCMAKE_INSTALL_PREFIX=appdir \
+                -B build -G Ninja .
+
+      - name: Configure Build (Apple Silicon)
+        if: matrix.arch == 'arm64'
+        run: |
+          cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_PREFIX_PATH=$(brew --prefix qt@5) \
+                -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@1.1) \
+                -DOPENSSL_LIBRARIES=$(brew --prefix openssl@1.1)/lib \
+                -DCMAKE_INSTALL_PREFIX=appdir \
+                -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                -B build -G Ninja .
+
+      - name: Build Application
+        run: ninja -j$(sysctl -n hw.ncpu) -C build
+
+      - name: Install Application
+        run: ninja -C build install
+
+      - name: Package DMG
+        run: |
+          mv appdir/android-file-transfer.app appdir/Android\ File\ Transfer\ for\ Linux.app
+          git clone https://github.com/andreyvit/create-dmg.git
+          cd create-dmg
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            ./create-dmg --volicon "../osx/android-file-transfer.icns" \
+                        --icon-size 96 \
+                        --icon "Android File Transfer for Linux" 110 100 \
+                        --app-drop-link 380 100 \
+                        AndroidFileTransferForLinux-ARM64.dmg \
+                        ../appdir/Android\ File\ Transfer\ for\ Linux.app
+          else
+            ./create-dmg --volicon "../osx/android-file-transfer.icns" \
+                        --icon-size 96 \
+                        --icon "Android File Transfer for Linux" 110 100 \
+                        --app-drop-link 380 100 \
+                        AndroidFileTransferForLinux.dmg \
+                        ../appdir/Android\ File\ Transfer\ for\ Linux.app
+          fi
+
+      - name: Code Sign (Apple Silicon)
+        if: matrix.arch == 'arm64' && github.ref_type == 'tag'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ]; then
+            echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+            security create-keychain -p "" build.keychain
+            security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+            security unlock-keychain -p "" build.keychain
+            
+            codesign --force --deep --sign "$APPLE_SIGNING_IDENTITY" \
+                    --options runtime \
+                    create-dmg/*.dmg
+          fi
+
+      - name: Upload Release Artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Android File Transfer for Linux ${{ env.TAG_CHANNEL }}"
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: create-dmg/*.dmg

@@ -6,163 +6,16 @@ on:
     branches:
       - master
       - MacOS_I8n_Fix
+      - github_action_optimization_v2
     tags:
       - "v*"
 
 permissions: write-all
-env:
-  TAG_NAME: continuous
-  TAG_CHANNEL: Continuous
-concurrency:
-  group: "${{ github.workflow }} - ${{ github.head_ref || github.ref }}"
 
 jobs:
-  check_tag:
-    name: Check Tag Version Consistency
-    runs-on: ubuntu-latest
-    if: github.ref_type == 'tag'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Check tag format
-        id: check_tag
-        run: |
-          TAG_REF="${GITHUB_REF##*/}"
-          echo "Current tag: $TAG_REF"
-          if [[ ! "$TAG_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
-            echo "Tag format should be v*.*.*"
-            exit 1
-          fi
-          echo "Tag format is valid."
-
-  prepare_release:
-    name: Prepare Release
-    needs: check_tag
-    runs-on: ubuntu-latest
-    if: github.ref_name == 'master' || github.ref_type == 'tag'
-    steps:
-      - name: Delete Old Continuous Release
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const tagName = '${{ env.TAG_NAME }}';
-            
-            try {
-              // 获取release
-              const { data: release } = await github.rest.repos.getReleaseByTag({
-                owner,
-                repo,
-                tag: tagName
-              });
-              
-              // 删除release下的所有资产
-              if (release.assets && release.assets.length > 0) {
-                for (const asset of release.assets) {
-                  await github.rest.repos.deleteReleaseAsset({
-                    owner,
-                    repo,
-                    asset_id: asset.id
-                  });
-                }
-              }
-              
-              // 删除release
-              await github.rest.repos.deleteRelease({
-                owner,
-                repo,
-                release_id: release.id
-              });
-              
-              // 删除tag
-              await github.rest.git.deleteRef({
-                owner,
-                repo,
-                ref: `tags/${tagName}`
-              });
-              
-            } catch (error) {
-              if (error.status !== 404) {
-                console.error('Error:', error);
-                throw error;
-              }
-            }
-
-  create_release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    needs: prepare_release
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Set Build Time
-        run: echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> $GITHUB_ENV
-        shell: bash
-
-      - name: Create Release Notes
-        run: |
-          cat > release.txt << EOF
-          ## Android File Transfer for Linux - ${{ env.TAG_CHANNEL }} Build
-          
-          This is the ${{ env.TAG_CHANNEL }} build of Android File Transfer for Linux.
-          
-          ### Downloads
-          
-          #### Linux
-          - **AppImage**: For most Linux distributions (x86_64)
-          
-          #### macOS  
-          - **DMG**: For macOS 10.12 and later (Intel)
-          - **Apple Silicon**: Native ARM64 support (coming soon)
-          
-          ### System Requirements
-          - Linux: Modern distribution with FUSE support
-          - macOS: 10.12 or later
-          
-          ### Features
-          - MTP client for Android devices
-          - Simple and intuitive UI
-          - No file size limitations
-          - FUSE wrapper for mounting devices
-          - Command line tools
-          - Multi-language support (now including Chinese!)
-          
-          ### Installation
-          1. Download the appropriate package for your system
-          2. For AppImage: Make executable and run
-          3. For DMG: Mount and drag to Applications
-          
-          Build time: ${{ env.BUILDTIME }}
-          Git commit: ${{ github.sha }}
-          EOF
-
-      - name: Create Release
-        id: create_release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ env.TAG_NAME }}
-          name: "Android File Transfer for Linux ${{ env.TAG_CHANNEL }}"
-          bodyFile: release.txt
-          prerelease: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-          allowUpdates: true
-          removeArtifacts: false
-
   build-linux:
     name: Build Linux x86_64
-    needs: create_release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -193,7 +46,8 @@ jobs:
           ./linuxdeployqt-continuous-x86_64.AppImage build/appdir/usr/share/applications/*.desktop -bundle-non-qt-libs -appimage
           find build/appdir -executable -type f -exec ldd {} \; | grep " => /usr" | cut -d " " -f 2-3 | sort | uniq
 
-      - name: Upload Release Artifacts
+      - name: Upload to Release (Tag)
+        if: github.ref_type == 'tag'
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
@@ -201,11 +55,24 @@ jobs:
           omitName: true
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: ./Android*.AppImage*
-          tag: ${{ env.TAG_NAME }}
+          tag: ${{ github.ref_name }}
+          makeLatest: true
+
+      - name: Upload to Continuous Release (Push)
+        if: github.ref_type != 'tag'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          omitBody: true
+          omitName: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: ./Android*.AppImage*
+          tag: continuous
+          prerelease: true
+          removeArtifacts: true
 
   build-macos:
     name: Build macOS
-    needs: create_release
     strategy:
       fail-fast: false
       matrix:
@@ -298,7 +165,8 @@ jobs:
                     create-dmg/*.dmg
           fi
 
-      - name: Upload Release Artifacts
+      - name: Upload to Release (Tag)
+        if: github.ref_type == 'tag'
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
@@ -306,4 +174,18 @@ jobs:
           omitName: true
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: create-dmg/*.dmg
-          tag: ${{ env.TAG_NAME }}
+          tag: ${{ github.ref_name }}
+          makeLatest: true
+
+      - name: Upload to Continuous Release (Push)
+        if: github.ref_type != 'tag'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          omitBody: true
+          omitName: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: create-dmg/*.dmg
+          tag: continuous
+          prerelease: true
+          removeArtifacts: true
